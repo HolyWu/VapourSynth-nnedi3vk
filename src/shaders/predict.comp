@@ -1,0 +1,301 @@
+#version 460
+// nnedi3vk predict kernel.
+//
+// One subgroup evaluates PX output pixels: the windows are staged in shared
+// memory (pre-scaled by 1/std), then the 2*NNS neuron dot products run as a
+// blocked cooperative GEMM — lane l accumulates neuron pairs l, l+SGSIZE, ...
+// against weights stored transposed ((softmax, elliott) pairs contiguous per
+// window element). Each weight vector is loaded once per subgroup and FMA'd
+// against all PX windows, which multiplies the arithmetic intensity by PX:
+// with one pixel per subgroup the kernel is entirely bound on re-loading the
+// weight matrix from L1/L2. The softmax/elliott reduction (wae5) then needs
+// two subgroupAdds per pixel.
+//
+// The window mean/variance use a two-pass float computation (the reference
+// accumulates in double; two-pass float tracks it closely without fp64).
+//
+// FP16 inputs (PIXEL_TYPE == 2) run the GEMM in half precision, two f16vec2
+// FMA chains per neuron fed by f16vec4 weight loads. To keep half-precision
+// accumulation well conditioned the window is centered before scaling
+// ((x - mean)/std instead of the reference's x/std); the exact difference,
+// rowSum * mean/std per neuron, is added back in float using per-neuron
+// weight row sums computed on the host.
+//
+// USE_LIST: pixels come from the prescreen kernel's compacted list
+// (dispatched indirectly); otherwise (pscrn=0) every pixel is evaluated.
+
+#include "common.glsl"
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x_id = 0) in;
+
+layout(constant_id = 8) const bool USE_LIST = true;
+
+const int FS = XDIM * YDIM;                  // window elements
+const int PPL = (NNS + SGSIZE - 1) / SGSIZE; // neuron pairs per lane
+const int EPL = (FS + SGSIZE - 1) / SGSIZE;  // window elements per lane
+const int PAIRS_PL = (FS / 2 + SGSIZE - 1) / SGSIZE; // f16 window pairs per lane
+
+// Pixels per subgroup: with few neuron pairs per lane the kernel is bound on
+// issuing loads rather than FMAs, so wider pixel blocking pays — but only
+// while the shared-memory windows stay small enough to keep occupancy up
+// (measured cutoffs; FP16 windows are half the size but showed no gain from
+// 8). The accumulators are fixed banks of vec4s indexed only by unrolled
+// constants so they stay in registers. Must match the gemvPX computation in
+// nnedi3vk.cpp.
+#if PIXEL_TYPE == 2
+const int PX = 4;
+#else
+const int PX = (PPL <= 2 && FS <= 128) ? 8 : 4;
+#endif
+
+#if PIXEL_TYPE == 2
+// Per quality q, element (k2, p): f16vec4(softmax_p[2*k2], softmax_p[2*k2+1],
+// elliott_p[2*k2], elliott_p[2*k2+1]) at index q*(FS/2)*NNS + k2*NNS + p.
+layout(binding = 3, scalar) readonly restrict buffer PdWeights { f16vec4 pdW[]; };
+#else
+// Per quality q, element (k, p): vec2(softmax_p[k], elliott_p[k]) at index
+// q*FS*NNS + k*NNS + p.
+layout(binding = 3, scalar) readonly restrict buffer PdWeights { vec2 pdW[]; };
+#endif
+
+// Per quality q: NNS vec2 biases (softmax, elliott), then NNS vec2 weight row
+// sums (softmax, elliott; only used by the FP16 path).
+layout(binding = 4, scalar) readonly restrict buffer PdBias { vec2 pdB[]; };
+
+layout(binding = 5, scalar) readonly restrict buffer ListBuf { uint listBuf[]; };
+layout(binding = 6, scalar) readonly restrict buffer CountBuf {
+    uint predCount;
+    uint groupsX;
+    uint groupsY;
+    uint groupsZ;
+};
+
+// The windows are packed with the px dimension in vector components so the
+// GEMM loop needs only one or two wide shared loads per window element:
+// FP16: f16vec4 slot px/2 holds pixel pairs (.xy = even px, .zw = odd px);
+// float: vec4 group px/4 holds pixel px in component px%4.
+#if PIXEL_TYPE == 2
+shared f16vec4 shIn[SUBGROUPS * (PX / 2) * (FS / 2)];
+#else
+shared vec4 shIn[SUBGROUPS * (PX / 4) * FS];
+#endif
+
+void main() {
+    const uint firstPix = (gl_WorkGroupID.x * uint(SUBGROUPS) + gl_SubgroupID) * uint(PX);
+    const uint npix = USE_LIST ? predCount : uint(pc.width * pc.rows);
+    if (firstPix >= npix)
+        return;
+    const int npx = int(min(uint(PX), npix - firstPix)); // uniform within the subgroup
+
+    const int lane = int(gl_SubgroupInvocationID);
+
+    uint idxs[PX];
+    float mstd0[PX], mstd1[PX], mstd2[PX], result[PX];
+#if PIXEL_TYPE == 2
+    // Even-px window pairs are held here until the odd px of the pair
+    // completes the full f16vec4 shared store (partial component stores
+    // read-modify-write).
+    f16vec2 pending[PAIRS_PL];
+#endif
+
+    // Gather the windows, their moments, and stage the pre-scaled values:
+    // x/std for float paths (reference math), (x - mean)/std for the FP16
+    // path (see header comment). Tail pixels beyond npx re-process the last
+    // valid pixel so every shared slot is fully written; their outputs are
+    // simply not stored.
+    [[unroll]] for (int px = 0; px < PX; px++) {
+        const uint li = min(firstPix + uint(px), npix - 1u);
+        const uint idx = USE_LIST ? listBuf[li] : li;
+        idxs[px] = idx;
+
+        // Top-left of the window in the padded plane.
+        const ivec2 org = windowOrigin(idx);
+        const int col0 = org.x, row0 = org.y;
+
+#if PIXEL_TYPE == 2
+        const int shBase = (int(gl_SubgroupID) * (PX / 2) + px / 2) * (FS / 2);
+        float v0[PAIRS_PL], v1[PAIRS_PL];
+        float sum = 0.0;
+        [[unroll]] for (int t = 0; t < PAIRS_PL; t++) {
+            const int k2 = lane + t * SGSIZE;
+            if ((FS / 2) % SGSIZE != 0 && k2 >= FS / 2)
+                continue;
+            const int e = k2 * 2;
+            v0[t] = loadPad(row0 + e / XDIM, col0 + e % XDIM);
+            v1[t] = loadPad(row0 + (e + 1) / XDIM, col0 + (e + 1) % XDIM);
+            sum += v0[t] + v1[t];
+        }
+#else
+        const int shBase = (int(gl_SubgroupID) * (PX / 4) + px / 4) * FS;
+        float v[EPL];
+        float sum = 0.0;
+        [[unroll]] for (int t = 0; t < EPL; t++) {
+            const int e = lane + t * SGSIZE;
+            if (FS % SGSIZE != 0 && e >= FS)
+                continue;
+            v[t] = loadPad(row0 + e / XDIM, col0 + e % XDIM);
+            sum += v[t];
+        }
+#endif
+
+        const float mean = subgroupAdd(sum) / float(FS);
+
+        float s2 = 0.0;
+#if PIXEL_TYPE == 2
+        [[unroll]] for (int t = 0; t < PAIRS_PL; t++) {
+            const int k2 = lane + t * SGSIZE;
+            if ((FS / 2) % SGSIZE != 0 && k2 >= FS / 2)
+                continue;
+            const float d0 = v0[t] - mean;
+            const float d1 = v1[t] - mean;
+            s2 += d0 * d0 + d1 * d1;
+        }
+#else
+        [[unroll]] for (int t = 0; t < EPL; t++) {
+            const int e = lane + t * SGSIZE;
+            if (FS % SGSIZE != 0 && e >= FS)
+                continue;
+            const float d = v[t] - mean;
+            s2 += d * d;
+        }
+#endif
+        const float variance = subgroupAdd(s2) / float(FS);
+
+        computeMstd(mean, variance, mstd0[px], mstd1[px], mstd2[px]);
+        result[px] = 0.0;
+
+#if PIXEL_TYPE == 2
+        [[unroll]] for (int t = 0; t < PAIRS_PL; t++) {
+            const int k2 = lane + t * SGSIZE;
+            if ((FS / 2) % SGSIZE != 0 && k2 >= FS / 2)
+                continue;
+            const f16vec2 val = f16vec2((v0[t] - mean) * mstd2[px], (v1[t] - mean) * mstd2[px]);
+            if (px % 2 == 0)
+                pending[t] = val;
+            else
+                shIn[shBase + k2] = f16vec4(pending[t], val);
+        }
+#else
+        [[unroll]] for (int t = 0; t < EPL; t++) {
+            const int e = lane + t * SGSIZE;
+            if (FS % SGSIZE != 0 && e >= FS)
+                continue;
+            shIn[shBase + e][px % 4] = v[t] * mstd2[px];
+        }
+#endif
+    }
+    subgroupBarrier();
+
+    [[unroll]] for (int q = 0; q < QUAL; q++) {
+        const int bBase = q * 2 * NNS;
+
+#if PIXEL_TYPE == 2
+        const int wBase = q * (FS / 2) * NNS;
+        const int shSub = int(gl_SubgroupID) * (PX / 2) * (FS / 2);
+        // px pairs packed into f16vec4 banks: bank b holds pixels 2b/2b+1
+        // ([t].xy / [t].zw). Banks 2/3 exist only when PX == 8 (spec-folded).
+        f16vec4 accS0[PPL], accS1[PPL], accS2[PPL], accS3[PPL];
+        f16vec4 accE0[PPL], accE1[PPL], accE2[PPL], accE3[PPL];
+        [[unroll]] for (int t = 0; t < PPL; t++) {
+            accS0[t] = f16vec4(0.0); accS1[t] = f16vec4(0.0);
+            accS2[t] = f16vec4(0.0); accS3[t] = f16vec4(0.0);
+            accE0[t] = f16vec4(0.0); accE1[t] = f16vec4(0.0);
+            accE2[t] = f16vec4(0.0); accE3[t] = f16vec4(0.0);
+        }
+        for (int k2 = 0; k2 < FS / 2; k2++) {
+            const f16vec4 x0 = shIn[shSub + 0 * (FS / 2) + k2];
+            const f16vec4 x1 = shIn[shSub + 1 * (FS / 2) + k2];
+            f16vec4 x2 = f16vec4(0.0), x3 = f16vec4(0.0);
+            if (PX == 8) {
+                x2 = shIn[shSub + 2 * (FS / 2) + k2];
+                x3 = shIn[shSub + 3 * (FS / 2) + k2];
+            }
+            [[unroll]] for (int t = 0; t < PPL; t++) {
+                const int p = lane + t * SGSIZE;
+                if (NNS % SGSIZE != 0 && p >= NNS)
+                    continue;
+                const f16vec4 w = pdW[wBase + k2 * NNS + p];
+                accS0[t] = fma(w.xyxy, x0, accS0[t]);
+                accS1[t] = fma(w.xyxy, x1, accS1[t]);
+                accE0[t] = fma(w.zwzw, x0, accE0[t]);
+                accE1[t] = fma(w.zwzw, x1, accE1[t]);
+                if (PX == 8) {
+                    accS2[t] = fma(w.xyxy, x2, accS2[t]);
+                    accS3[t] = fma(w.xyxy, x3, accS3[t]);
+                    accE2[t] = fma(w.zwzw, x2, accE2[t]);
+                    accE3[t] = fma(w.zwzw, x3, accE3[t]);
+                }
+            }
+        }
+#else
+        const int wBase = q * FS * NNS;
+        const int shSub = int(gl_SubgroupID) * (PX / 4) * FS;
+        // px dimension vectorized: component px%4 of bank px/4 is pixel px.
+        // Bank 1 exists only when PX == 8 (spec-folded).
+        vec4 accSa[PPL], accSb[PPL], accEa[PPL], accEb[PPL];
+        [[unroll]] for (int t = 0; t < PPL; t++) {
+            accSa[t] = vec4(0.0); accSb[t] = vec4(0.0);
+            accEa[t] = vec4(0.0); accEb[t] = vec4(0.0);
+        }
+        for (int k = 0; k < FS; k++) {
+            const vec4 xa = shIn[shSub + k];
+            vec4 xb = vec4(0.0);
+            if (PX == 8)
+                xb = shIn[shSub + FS + k];
+            [[unroll]] for (int t = 0; t < PPL; t++) {
+                const int p = lane + t * SGSIZE;
+                if (NNS % SGSIZE != 0 && p >= NNS)
+                    continue;
+                const vec2 w = pdW[wBase + k * NNS + p];
+                accSa[t] = fma(vec4(w.x), xa, accSa[t]);
+                accEa[t] = fma(vec4(w.y), xa, accEa[t]);
+                if (PX == 8) {
+                    accSb[t] = fma(vec4(w.x), xb, accSb[t]);
+                    accEb[t] = fma(vec4(w.y), xb, accEb[t]);
+                }
+            }
+        }
+#endif
+
+        [[unroll]] for (int px = 0; px < PX; px++) {
+            if (px >= npx)
+                break;
+
+            float vsum = 0.0, wsum = 0.0;
+            [[unroll]] for (int t = 0; t < PPL; t++) {
+                const int p = lane + t * SGSIZE;
+                if (NNS % SGSIZE != 0 && p >= NNS)
+                    continue;
+                const vec2 bias = pdB[bBase + p];
+#if PIXEL_TYPE == 2
+                const f16vec4 bS = px < 2 ? accS0[t] : px < 4 ? accS1[t] : px < 6 ? accS2[t] : accS3[t];
+                const f16vec4 bE = px < 2 ? accE0[t] : px < 4 ? accE1[t] : px < 6 ? accE2[t] : accE3[t];
+                const f16vec2 aS = px % 2 == 0 ? bS.xy : bS.zw;
+                const f16vec2 aE = px % 2 == 0 ? bE.xy : bE.zw;
+                const vec2 rowSum = pdB[bBase + NNS + p];
+                const float corr = mstd0[px] * mstd2[px];
+                const float actS = float(aS.x) + float(aS.y) + fma(rowSum.x, corr, bias.x);
+                const float actE = float(aE.x) + float(aE.y) + fma(rowSum.y, corr, bias.y);
+#else
+                const float actS = (px < 4 ? accSa[t][px] : accSb[t][px - 4]) + bias.x;
+                const float actE = (px < 4 ? accEa[t][px] : accEb[t][px - 4]) + bias.y;
+#endif
+                wae5Accum(actS, actE, vsum, wsum);
+            }
+            vsum = subgroupAdd(vsum);
+            wsum = subgroupAdd(wsum);
+
+            result[px] += wae5Blend(vsum, wsum, mstd0[px], mstd1[px]);
+        }
+    }
+
+    if (subgroupElect())
+        [[unroll]] for (int px = 0; px < PX; px++) {
+            if (px >= npx)
+                break;
+            dstBuf[idxs[px]] = storePix(result[px] / float(QUAL));
+        }
+}

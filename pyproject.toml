@@ -1,0 +1,32 @@
+[build-system]
+requires = ["meson-python", "VapourSynth>=74"]
+build-backend = "mesonpy"
+
+[project]
+name = "vapoursynth-nnedi3vk"
+description = "Neural Network Edge Directed Interpolation 3, using Vulkan compute"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+keywords = ["vapoursynth", "nnedi3", "vulkan"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Plugins",
+  "Natural Language :: English",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX",
+  "Operating System :: Unix",
+  "Programming Language :: C++",
+  "Topic :: Multimedia :: Video",
+]
+dependencies = ["VapourSynth>=74"]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/HolyWu/VapourSynth-nnedi3vk"
+Issues = "https://github.com/HolyWu/VapourSynth-nnedi3vk/issues"
+
+[tool.meson-python.wheel]
+exclude = ["*.dll.a"]

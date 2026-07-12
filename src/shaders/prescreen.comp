@@ -1,0 +1,172 @@
+#version 460
+// nnedi3vk prescreen kernel.
+//
+// Runs the prescreener network over every interpolated pixel, writes the
+// cheap cubic interpolation result for the pixels it accepts, and compacts
+// the indices of rejected pixels into a list for the predict kernel (one
+// subgroup-aggregated atomic per subgroup). It also maintains the indirect
+// dispatch size for the predict kernel via atomicMax.
+//
+// The prescreener decision must match the znedi3 C kernel bit-for-bit so the
+// predict kernel runs on exactly the same pixel set: all dot products
+// accumulate with `precise` float math in the reference order (no FMA
+// contraction, no reassociation).
+//
+// PSCRN == 1 (old): 12x4 window, one pixel per thread, three layers.
+// PSCRN >= 2 (new): 16x4 window, four consecutive pixels per thread, two
+// layers (the L0/L1/L2 variants only differ in the weights the host uploads).
+
+#include "common.glsl"
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+layout(local_size_x_id = 0) in;
+
+const int P = (PSCRN == 1) ? 1 : 4; // pixels per thread
+
+// Prescreener weights, prepared on the host (mean-subtracted and scaled by
+// 1/pixel_half), viewed as vec4s. The layer-0 kernel is transposed so vec4 k
+// holds all four neurons' weights for window element k; the remaining layers
+// live at fixed vec4 indices behind it:
+// old: l0T[48], b0 = [48], l1 row n = [49+n], b1 = [53], l2 row n = [54+2n..55+2n], b2 = [62]
+// new: l0T[64], b0 = [64], l1 row n = [65+n], b1 = [69]
+layout(binding = 2, scalar) readonly restrict buffer PsWeights { vec4 psW4[]; };
+
+// Pixel indices (r * width + x) the prescreener rejected.
+layout(binding = 5, scalar) writeonly restrict buffer ListBuf { uint listBuf[]; };
+
+// Cleared to {0, 0, 1, 1} before this kernel; groupsX/Y/Z feed
+// vkCmdDispatchIndirect for the predict kernel.
+layout(binding = 6, scalar) buffer CountBuf {
+    uint predCount;
+    uint groupsX;
+    uint groupsY;
+    uint groupsZ;
+};
+
+// 4-tap cubic interpolation in the reference order (cubic_interpolation_c).
+float cubic(int r, int col) {
+    precise float acc = 0.0;
+    acc += (-3.0 / 32.0) * loadPad(r + 1, col);
+    acc += (19.0 / 32.0) * loadPad(r + 2, col);
+    acc += (19.0 / 32.0) * loadPad(r + 3, col);
+    acc += (-3.0 / 32.0) * loadPad(r + 4, col);
+    return acc;
+}
+
+void main() {
+    const int xg = (pc.width + P - 1) / P; // pixel groups per row
+    const int gid = int(gl_GlobalInvocationID.x);
+    const int r = gid / xg;
+    const int xbase = (gid % xg) * P;
+    const bool valid = r < pc.rows;
+
+    uint needMask = 0u; // bit n set -> pixel xbase+n needs the predictor
+
+    if (valid) {
+        if (PSCRN == 1) {
+            // Window is 12x4 starting at column xbase-5; layer 0 accumulates
+            // all four neurons in one pass over the window.
+            precise float st0 = 0.0, st1 = 0.0, st2 = 0.0, st3 = 0.0;
+            for (int k = 0; k < 48; k++) {
+                const float v = loadPad(r + 1 + k / 12, xbase - 5 + k % 12 + MARGIN_H);
+                const vec4 w = psW4[k];
+                st0 += w.x * v;
+                st1 += w.y * v;
+                st2 += w.z * v;
+                st3 += w.w * v;
+            }
+
+            const vec4 b0 = psW4[48];
+            precise float st[8];
+            st[0] = st0 + b0.x;
+            st[1] = elliott(st1 + b0.y);
+            st[2] = elliott(st2 + b0.z);
+            st[3] = elliott(st3 + b0.w);
+
+            const vec4 b1 = psW4[53];
+            [[unroll]] for (int n = 0; n < 4; n++) {
+                const vec4 w = psW4[49 + n];
+                precise float acc = 0.0;
+                [[unroll]] for (int k = 0; k < 4; k++)
+                    acc += w[k] * st[k];
+                st[4 + n] = elliott(acc + b1[n]);
+            }
+
+            const vec4 b2 = psW4[62];
+            precise float l2[4];
+            [[unroll]] for (int n = 0; n < 4; n++) {
+                const vec4 wa = psW4[54 + n * 2];
+                const vec4 wb = psW4[55 + n * 2];
+                precise float acc = 0.0;
+                [[unroll]] for (int k = 0; k < 4; k++)
+                    acc += wa[k] * st[k];
+                [[unroll]] for (int k = 0; k < 4; k++)
+                    acc += wb[k] * st[4 + k];
+                l2[n] = acc + b2[n];
+            }
+
+            if (max(l2[2], l2[3]) > max(l2[0], l2[1]))
+                needMask = 1u;
+        } else {
+            // Window is 16x4 starting at column xbase-6; one thread decides
+            // four consecutive output pixels.
+            precise float st0 = 0.0, st1 = 0.0, st2 = 0.0, st3 = 0.0;
+            for (int k = 0; k < 64; k++) {
+                const float v = loadPad(r + 1 + k / 16, xbase - 6 + k % 16 + MARGIN_H);
+                const vec4 w = psW4[k];
+                st0 += w.x * v;
+                st1 += w.y * v;
+                st2 += w.z * v;
+                st3 += w.w * v;
+            }
+
+            const vec4 b0 = psW4[64];
+            float st[4];
+            st[0] = elliott(st0 + b0.x);
+            st[1] = elliott(st1 + b0.y);
+            st[2] = elliott(st2 + b0.z);
+            st[3] = elliott(st3 + b0.w);
+
+            const vec4 b1 = psW4[69];
+            [[unroll]] for (int n = 0; n < 4; n++) {
+                const vec4 w = psW4[65 + n];
+                precise float acc = 0.0;
+                [[unroll]] for (int k = 0; k < 4; k++)
+                    acc += w[k] * st[k];
+                if (!(acc + b1[n] > 0.0))
+                    needMask |= 1u << n;
+            }
+        }
+    }
+
+    int cnt = 0;
+    uint pixIdx[4];
+    if (valid) {
+        [[unroll]] for (int n = 0; n < P; n++) {
+            const int x = xbase + n;
+            if (x >= pc.width)
+                break;
+            const uint idx = uint(r) * uint(pc.width) + uint(x);
+            if ((needMask & (1u << n)) != 0u)
+                pixIdx[cnt++] = idx;
+            else
+                dstBuf[idx] = storePix(cubic(r, x + MARGIN_H));
+        }
+    }
+
+    // Compact the rejected pixels: one atomic per subgroup, in-subgroup
+    // offsets via an exclusive scan.
+    const uint total = subgroupAdd(uint(cnt));
+    uint base = 0u;
+    if (subgroupElect() && total > 0u) {
+        base = atomicAdd(predCount, total);
+        atomicMax(groupsX, (base + total + uint(SUBGROUPS) - 1u) / uint(SUBGROUPS));
+    }
+    base = subgroupBroadcastFirst(base);
+    const uint off = base + subgroupExclusiveAdd(uint(cnt));
+    for (int c = 0; c < cnt; c++)
+        listBuf[off + c] = pixIdx[c];
+}
