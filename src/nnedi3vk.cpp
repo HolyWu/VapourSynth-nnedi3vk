@@ -39,6 +39,10 @@
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
 #include <vk_mem_alloc.h>
 
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
+
 using namespace std::string_literals;
 
 // Must match common.glsl.
@@ -240,6 +244,17 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBits
 
 // Must be called with g_vkMutex held.
 std::shared_ptr<VulkanGlobals> acquireGlobals() {
+#ifdef __linux__
+    static std::once_flag XInitThreadsOnce;
+    std::call_once(XInitThreadsOnce, [] {
+        if (void* x11 = dlopen("libX11.so", RTLD_LAZY | RTLD_GLOBAL)) {
+            using XInitThreadsFn = int (*)();
+            if (auto fn = reinterpret_cast<XInitThreadsFn>(dlsym(x11, "XInitThreads")))
+                fn();
+        }
+    });
+#endif
+
     if (auto g = g_globals.lock())
         return g;
 
